@@ -5880,6 +5880,231 @@ OpFoldResult CompareOp::fold(ArrayRef<Attribute> operands) {
 // ScatterOp
 //===----------------------------------------------------------------------===//
 
+/*
+ * We intend to verify the following properties:
+ * P1. The 'update_window_dims' must be valid indices of 'updates' tensor.
+ * P2. The 'inserted_window_dims' must be valid indices of 'operand' tensor.
+ * P3. Check if the rank-of('operand') == size-of('update_window_dims') +
+ *     size-of('inserted_window_dims')
+ * P4. size-of('scatter_dims_to_operand_dims') =
+ *         'scatter_indices'['index_vector_dim'] &
+ *     'scatter_dims_to_operand_dims' must be valid indices of 'operand' tensor.
+ */
+LogicalResult ValidateScatterDimensionNumbers(
+    RankedTensorType operand_type, ArrayRef<int64_t> scatter_indices_shape,
+    RankedTensorType update_type,
+    mlir::mhlo::ScatterDimensionNumbersAttr dim_numbers, Location loc) {
+  // P1.
+  auto update_window_dims = to_vector(dim_numbers.getUpdateWindowDims());
+  if (!llvm::is_sorted(update_window_dims))
+    return mlir::emitError(loc)
+           << "expects update_window_dims to be sorted; got: ["
+           << update_window_dims << "].";
+
+  auto last = llvm::unique(update_window_dims,
+                           [](int64_t a, int64_t b) { return a == b; });
+  if (last != update_window_dims.end())
+    return mlir::emitError(loc)
+           << "expects update_window_dims to not repeat; got: ["
+           << update_window_dims << "].";
+
+  for (int64_t window_dim : update_window_dims) {
+    if (window_dim < 0 || window_dim >= update_type.getRank()) {
+      return mlir::emitError(loc)
+             << "expects each element of update_window_dims to be in range [0, "
+             << update_type.getRank() << "). got: " << window_dim << ".";
+    }
+  }
+
+  // P2.
+  auto inserted_window_dims = to_vector(dim_numbers.getInsertedWindowDims());
+  if (!llvm::is_sorted(inserted_window_dims))
+    return mlir::emitError(loc)
+           << "expects inserted_window_dims to be sorted; got: ["
+           << inserted_window_dims << "].";
+
+  last = llvm::unique(inserted_window_dims,
+                      [](int64_t a, int64_t b) { return a == b; });
+  if (last != inserted_window_dims.end())
+    return mlir::emitError(loc)
+           << "expects inserted_window_dims to not repeat; got: ["
+           << inserted_window_dims << "].";
+
+  for (int64_t inserted_dim : inserted_window_dims) {
+    if (inserted_dim < 0 || inserted_dim >= operand_type.getRank()) {
+      return mlir::emitError(loc)
+             << "expects each element of inserted_window_dims to be in range "
+                "[0, "
+             << operand_type.getRank() << "). got: " << inserted_dim << ".";
+    }
+  }
+
+  // P3.
+  auto window_size = update_window_dims.size() + inserted_window_dims.size();
+  if (operand_type.getRank() != window_size)
+    return mlir::emitError(loc)
+           << "expects rank-of operand to match the window size ("
+           << window_size << "), but got" << operand_type.getRank() << ".";
+
+  // P4.
+  auto scatter_dims_to_operand_dims =
+      to_vector(dim_numbers.getScatterDimsToOperandDims());
+  if (scatter_dims_to_operand_dims.size() !=
+      scatter_indices_shape[dim_numbers.getIndexVectorDim()])
+    return mlir::emitError(loc)
+           << "Scatter op has " << scatter_dims_to_operand_dims.size()
+           << " elements in scatter_dims_to_operand_dims and the bound of "
+              "dimension index_vector_dim="
+           << dim_numbers.getIndexVectorDim() << " of scatter_indices is "
+           << scatter_indices_shape[dim_numbers.getIndexVectorDim()]
+           << ". These two numbers must be equal.";
+
+  for (int i = 0; i < scatter_dims_to_operand_dims.size(); ++i) {
+    int64_t scatter_dim_to_operand_dim = scatter_dims_to_operand_dims[i];
+    if (scatter_dim_to_operand_dim < 0 ||
+        scatter_dim_to_operand_dim >= operand_type.getRank()) {
+      return mlir::emitError(loc)
+             << "Invalid scatter_dims_to_operand_dims mapping; domain is [0, "
+             << operand_type.getRank()
+             << "), "
+                "got: "
+             << i << "->" << scatter_dim_to_operand_dim << ".";
+    }
+  }
+
+  std::sort(scatter_dims_to_operand_dims.begin(),
+            scatter_dims_to_operand_dims.end());
+  last = llvm::unique(scatter_dims_to_operand_dims,
+                      [](int64_t a, int64_t b) { return a == b; });
+  if (last != scatter_dims_to_operand_dims.end())
+    return mlir::emitError(loc)
+           << "expects scatter_dims_to_operand_dims to not repeat; got: ["
+           << scatter_dims_to_operand_dims << "].";
+
+  return success();
+}
+
+/*
+ * We intend to verify the following properties:
+ *  P0. scatter_indices argument must be an integral tensor. Enformed by ODS.
+ *  P1. Scatter index leaf dimension must be within [0, rank(scatter_indices)"
+ *      " + 1). rank(scatter_indices) is %d and scatter index leaf dimension
+ *  P2. Verify reducer shape.
+ *  P3. Verify the shape for updates argument.
+ *  P4. Validate the scatter-dimensions-numbers.
+ *  P5. Valide the window bounds of 'update_window_dims' w.r.t the operand.
+ *  P6. Validate the window bounds of 'update_window_dims' w.r.t the
+ *      'scatter_indices'.
+ *  P7. Check return type.
+ */
+LogicalResult ScatterOp::verify() {
+  auto operand_type = operand().getType().dyn_cast<RankedTensorType>();
+  auto scatter_indices_type =
+      scatter_indices().getType().dyn_cast<RankedTensorType>();
+  auto updates_type = updates().getType().dyn_cast<RankedTensorType>();
+  if (!operand_type || !scatter_indices_type || !updates_type) return success();
+
+  // P1.
+  uint64_t index_vector_dim = scatter_dimension_numbers().getIndexVectorDim();
+  if (index_vector_dim > scatter_indices_type.getRank() || index_vector_dim < 0)
+    return emitOpError()
+           << "expects scatter index leaf dimension to be within [0, "
+              "rank(scatter_indices) + 1."
+              " rank(scatter_indices) is "
+           << scatter_indices_type.getRank()
+           << " and scatter index leaf dimension is " << index_vector_dim
+           << ".";
+
+  // P2.
+  // verifyReducerShape
+
+  // P3.
+  SmallVector<int64_t> expanded_scatter_indices_shape =
+      llvm::to_vector(scatter_indices_type.getShape());
+  if (expanded_scatter_indices_shape.size() == index_vector_dim)
+    expanded_scatter_indices_shape.push_back(1);
+
+  int64_t expected_updates_rank =
+      expanded_scatter_indices_shape.size() - 1 +
+      scatter_dimension_numbers().getUpdateWindowDims().size();
+  if (updates_type.getRank() != expected_updates_rank)
+    return emitOpError() << "expects updates tensor must be of rank "
+                         << expected_updates_rank << "; got "
+                         << updates_type.getRank() << ".";
+
+  // P4.
+  if (failed(ValidateScatterDimensionNumbers(
+          operand_type, expanded_scatter_indices_shape, updates_type,
+          scatter_dimension_numbers(), getLoc())))
+    return failure();
+
+  // P5.
+  auto operand_shape = operand_type.getShape();
+  auto updates_shape = updates_type.getShape();
+  auto inserted_window_dims =
+      scatter_dimension_numbers().getInsertedWindowDims();
+  auto update_window_dims = scatter_dimension_numbers().getUpdateWindowDims();
+
+  int64_t inserted_dims_seen = 0;
+  SmallVector<int64_t> max_update_slice_sizes;
+  const auto dimensions_size = operand_type.getRank();
+  max_update_slice_sizes.reserve(dimensions_size);
+  for (int i = 0; i < dimensions_size; ++i) {
+    if (inserted_dims_seen < inserted_window_dims.size() &&
+        inserted_window_dims[inserted_dims_seen] == i) {
+      ++inserted_dims_seen;
+    } else {
+      max_update_slice_sizes.push_back(operand_shape[i]);
+    }
+  }
+
+  for (int i = 0; i < update_window_dims.size(); ++i) {
+    auto update_window_dim = update_window_dims[i];
+    if (updates_shape[update_window_dim] > max_update_slice_sizes[i]) {
+      return emitOpError() << "expects bounds of the window dimensions of "
+                              "updates to not exceed the "
+                              "bounds of the corresponding dimensions of "
+                              "operand. For dimension "
+                           << update_window_dim << ", updates bound is "
+                           << updates_shape[update_window_dim]
+                           << ", operand bound is " << max_update_slice_sizes[i]
+                           << ".";
+    }
+  }
+
+  // P6.
+  int64_t scatter_dims_seen = 0;
+  for (int64_t i = 0; i < updates_shape.size(); ++i) {
+    bool is_update_window_dim = std::binary_search(update_window_dims.begin(),
+                                                   update_window_dims.end(), i);
+
+    if (is_update_window_dim) continue;
+    if (scatter_dims_seen == index_vector_dim) ++scatter_dims_seen;
+
+    if (updates_shape[i] != expanded_scatter_indices_shape[scatter_dims_seen]) {
+      return emitOpError() << "expects bounds of the scatter dimensions of "
+                              "updates to be same as the "
+                              "bounds of the corresponding dimensions of "
+                              "scatter indices. For "
+                              "scatter dimension "
+                           << i << ", updates bound is " << updates_shape[i]
+                           << " , scatter_indices "
+                              "bound is "
+                           << expanded_scatter_indices_shape[scatter_dims_seen]
+                           << ".";
+    }
+    ++scatter_dims_seen;
+  }
+
+  // P7.
+  if (!compatibleShapeAndElementType(operand_type, getResult().getType()))
+    return emitOpError()
+           << "expects the return type to be same as the operand type: "
+           << operand_type << ", but got " << getResult().getType() << ".";
+
+  return success();
+}
+
 llvm::SmallVector<Attribute, 4> evaluateMhloRegion(Region& region,
                                                    ArrayRef<Attribute> inputs) {
   if (region.getNumArguments() != inputs.size()) return {};
