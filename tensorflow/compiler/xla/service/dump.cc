@@ -305,7 +305,8 @@ static std::vector<std::string> DumpHloModuleImpl(
   std::vector<absl::optional<std::string>> file_paths;
 
   if (opts.dump_as_text) {
-    HloPrintOptions print_options;
+    auto print_options = HloPrintOptions::ShortParsable();
+    print_options.set_print_large_constants(false);
     print_options.set_print_backend_config(true);
     print_options.set_print_metadata(opts.dump_hlo_metadata);
     file_paths.push_back(DumpToFileInDirOrStdoutImpl(
